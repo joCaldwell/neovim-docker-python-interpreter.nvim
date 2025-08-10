@@ -46,6 +46,7 @@ M.defaults = {
 		compose_cmd = { "docker", "compose" },
 		path_map = { container_root = "/srv/app", host_root = nil },
 		auto_install_pyright = true,
+		pip_install_method = "auto", -- "auto", "system", "user", "break-system-packages"
 		health_check_interval = 300, -- seconds
 	},
 	pyright_settings = {
@@ -97,6 +98,10 @@ local function ensure_dir(p)
 	if vim.fn.isdirectory(p) == 0 then
 		vim.fn.mkdir(p, "p")
 	end
+end
+
+local function file_exists(path)
+	return vim.fn.filereadable(path) == 1
 end
 
 local function is_executable(path)
@@ -350,14 +355,17 @@ local function check_pyright_in_container(service)
 		return M.state.cache.container_pyright
 	end
 
-	local cmd = vim.list_extend(vim.deepcopy(M.state.opts.docker.compose_cmd), {
-		"exec",
-		"-T",
-		service,
-		"python",
-		"-c",
-		"import sys; import importlib.util; sys.exit(0 if importlib.util.find_spec('pyright') else 1)",
-	})
+	local cmd = vim.list_extend(
+		vim.deepcopy(M.state.opts.docker.compose_cmd),
+		{
+			"exec",
+			"-T",
+			service,
+			"python",
+			"-c",
+			"import sys; import importlib.util; sys.exit(0 if importlib.util.find_spec('pyright') else 1)",
+		}
+	)
 
 	vim.fn.system(cmd)
 	M.state.cache.container_pyright = vim.v.shell_error == 0
@@ -367,20 +375,48 @@ end
 local function install_pyright_in_container(service)
 	vim.notify("Installing Pyright in container...", vim.log.levels.INFO)
 
-	local cmd = vim.list_extend(
-		vim.deepcopy(M.state.opts.docker.compose_cmd),
-		{ "exec", "-T", service, "python", "-m", "pip", "install", "--user", "pyright" }
-	)
+	local install_methods = {}
+	local pip_method = M.state.opts.docker.pip_install_method or "auto"
 
-	local result = vim.fn.system(cmd)
-	if vim.v.shell_error ~= 0 then
-		vim.notify("Failed to install Pyright in container:\n" .. result, vim.log.levels.ERROR)
-		return false
+	if pip_method == "auto" then
+		-- Try multiple methods automatically
+		install_methods = {
+			{ "python", "-m", "pip", "install", "pyright" }, -- Standard install
+			{ "python", "-m", "pip", "install", "--user", "pyright" }, -- User install
+			{ "python", "-m", "pip", "install", "--break-system-packages", "pyright" }, -- Force install
+		}
+	elseif pip_method == "system" then
+		install_methods = { { "python", "-m", "pip", "install", "pyright" } }
+	elseif pip_method == "user" then
+		install_methods = { { "python", "-m", "pip", "install", "--user", "pyright" } }
+	elseif pip_method == "break-system-packages" then
+		install_methods = { { "python", "-m", "pip", "install", "--break-system-packages", "pyright" } }
 	end
 
-	M.state.cache.container_pyright = true
-	vim.notify("Pyright installed successfully", vim.log.levels.INFO)
-	return true
+	for i, install_args in ipairs(install_methods) do
+		local cmd = vim.deepcopy(M.state.opts.docker.compose_cmd)
+		vim.list_extend(cmd, { "exec", "-T", service })
+		vim.list_extend(cmd, install_args)
+
+		local result = vim.fn.system(cmd)
+		if vim.v.shell_error == 0 then
+			M.state.cache.container_pyright = true
+			vim.notify(
+				"Pyright installed successfully" .. (pip_method == "auto" and " (method " .. i .. ")" or ""),
+				vim.log.levels.INFO
+			)
+			return true
+		end
+	end
+
+	vim.notify(
+		"Failed to install Pyright in container. Please install manually:\n"
+			.. "docker compose exec "
+			.. service
+			.. " pip install pyright",
+		vim.log.levels.ERROR
+	)
+	return false
 end
 
 -- Interpreter discovery -------------------------------------------------------
@@ -482,7 +518,7 @@ local function build_local_cmd(python_bin)
 end
 
 local function stop_pyright()
-	for _, client in ipairs(vim.lsp.get_clients({ name = "pyright" })) do
+	for _, client in ipairs(vim.lsp.get_active_clients({ name = "pyright" })) do
 		client.stop(true)
 	end
 end
@@ -493,7 +529,7 @@ local function start_pyright(cmd, settings)
 	lspconfig.pyright.setup({
 		cmd = cmd,
 		root_dir = function(fname)
-			return vim.fs.dirname(vim.fs.find(".git", { path = fname, upward = true })[1]) or project_root()
+			return util.find_git_ancestor(fname) or project_root()
 		end,
 		settings = settings or {},
 		on_init = function(client)
@@ -553,7 +589,7 @@ function M.health_check()
 	end
 
 	-- Check LSP client
-	local clients = vim.lsp.get_clients({ name = "pyright" })
+	local clients = vim.lsp.get_active_clients({ name = "pyright" })
 	if #clients == 0 then
 		health.status = health.status == "healthy" and "degraded" or health.status
 		health.details.lsp = "Pyright LSP not running"
