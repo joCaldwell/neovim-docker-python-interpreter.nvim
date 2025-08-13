@@ -1,3 +1,5 @@
+# THIS PROJECT IS A WIP AND IS NOT CURRENTLY FUNCTIONAL
+
 # 🐳 neovim-docker-python-interpreter.nvim
 
 A Neovim plugin that seamlessly integrates Pyright LSP with Docker containers, solving the path mismatch problem between host and container environments. Perfect for Python development in containerized environments.
