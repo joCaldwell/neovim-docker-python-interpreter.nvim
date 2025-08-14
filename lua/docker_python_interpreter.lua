@@ -1,7 +1,3 @@
--- neovim-docker-python-interpreter.nvim
--- Author: joCaldwell
--- License: MIT
-
 local M = {}
 
 -- Dependencies check
@@ -61,6 +57,7 @@ M.defaults = {
 	cache_ttl = 60, -- seconds for venv discovery cache
 	auto_select = false, -- auto-select if only one option
 	prefer_docker = false, -- prefer Docker over local when both available
+	shim_log_file = nil, -- optional custom log file location
 }
 
 -- Utilities -------------------------------------------------------------------
@@ -108,226 +105,52 @@ local function is_executable(path)
 	return vim.fn.executable(path) == 1
 end
 
--- Enhanced shim with better error handling
-local function write_shim_file(host_root, container_root)
+-- Get the plugin's runtime directory
+local function get_plugin_dir()
+	-- Try to find the plugin directory
+	local runtime_paths = vim.api.nvim_list_runtime_paths()
+	for _, path in ipairs(runtime_paths) do
+		local test_path = path .. "/python/pyright_shim.py"
+		if file_exists(test_path) then
+			return path
+		end
+	end
+
+	-- Fallback: assume we're in a standard plugin location
+	local source = debug.getinfo(1, "S").source:sub(2) -- Remove @ prefix
+	local plugin_root = vim.fn.fnamemodify(source, ":p:h:h")
+	return plugin_root
+end
+
+-- Copy shim file to project directory (for Docker access)
+local function setup_shim_file(host_root, container_root)
+	local plugin_dir = get_plugin_dir()
+	local source_shim = plugin_dir .. "/python/pyright_shim.py"
+
+	-- Check if source exists
+	if not file_exists(source_shim) then
+		vim.notify("ERROR: pyright_shim.py not found in plugin directory", vim.log.levels.ERROR)
+		vim.notify("Looking for: " .. source_shim, vim.log.levels.ERROR)
+		return nil
+	end
+
+	-- Create .nvim directory in project
 	local shim_dir = host_root .. "/.nvim"
 	ensure_dir(shim_dir)
-	local shim_path = shim_dir .. "/docker_pyright_shim.py"
 
-	local shim = [[#!/usr/bin/env python3
-"""Enhanced JSON-RPC path rewrite shim for Docker Pyright integration."""
-import json
-import os
-import sys
-import subprocess
-import threading
-import traceback
-import logging
-from pathlib import Path
-from typing import Any, Dict, Optional
+	-- Copy shim to project directory
+	local dest_shim = shim_dir .. "/pyright_shim.py"
 
-# Configure logging
-logging.basicConfig(
-    level=logging.DEBUG if os.environ.get("DEBUG_SHIM") else logging.WARNING,
-    format='[%(asctime)s] %(levelname)s: %(message)s',
-    handlers=[logging.FileHandler('/tmp/pyright_shim.log'), logging.StreamHandler(sys.stderr)]
-)
-logger = logging.getLogger(__name__)
+	-- Read source file
+	local source_content = vim.fn.readfile(source_shim)
 
-HOST_ROOT = os.environ.get("HOST_ROOT", "/work/host")
-CONTAINER_ROOT = os.environ.get("CONTAINER_ROOT", "/work/container")
+	-- Write to destination
+	vim.fn.writefile(source_content, dest_shim)
+	vim.fn.setfperm(dest_shim, "rwxr-xr-x")
 
-# Normalize paths
-HOST_ROOT = str(Path(HOST_ROOT).resolve())
-CONTAINER_ROOT = str(Path(CONTAINER_ROOT).resolve())
+	vim.notify("Shim script copied to: " .. dest_shim, vim.log.levels.DEBUG)
 
-logger.info(f"Path mapping: {HOST_ROOT} <-> {CONTAINER_ROOT}")
-
-class PathRewriter:
-    """Handles bidirectional path rewriting."""
-    
-    PATH_KEYS = {
-        "uri", "targetUri", "source", "file", "path",
-        "rootPath", "rootUri", "workspaceFolders",
-        "documentUri", "newUri", "oldUri"
-    }
-    
-    @staticmethod
-    def rewrite_path(s: Any, from_prefix: str, to_prefix: str) -> Any:
-        """Rewrite a single path string."""
-        if not isinstance(s, str):
-            return s
-        
-        # Handle file:// URIs
-        if s.startswith("file://"):
-            path = s[7:]
-            # Handle percent-encoded paths
-            if '%' in path:
-                from urllib.parse import unquote
-                path = unquote(path)
-            
-            if path.startswith(from_prefix):
-                new_path = to_prefix + path[len(from_prefix):]
-                return "file://" + new_path
-            return s
-        
-        # Handle absolute paths
-        if s.startswith(from_prefix):
-            return to_prefix + s[len(from_prefix):]
-        
-        return s
-    
-    @classmethod
-    def rewrite_obj(cls, obj: Any, from_prefix: str, to_prefix: str) -> Any:
-        """Recursively rewrite paths in object."""
-        if isinstance(obj, dict):
-            result = {}
-            for k, v in obj.items():
-                if k in cls.PATH_KEYS:
-                    result[k] = cls.rewrite_path(v, from_prefix, to_prefix)
-                elif k == "workspaceFolders" and isinstance(v, list):
-                    # Special handling for workspace folders
-                    result[k] = [cls.rewrite_obj(item, from_prefix, to_prefix) for item in v]
-                else:
-                    result[k] = cls.rewrite_obj(v, from_prefix, to_prefix)
-            return result
-        elif isinstance(obj, list):
-            return [cls.rewrite_obj(item, from_prefix, to_prefix) for item in obj]
-        elif isinstance(obj, str):
-            # Check if this looks like a path even if not in expected keys
-            if (obj.startswith(from_prefix) or obj.startswith("file://")):
-                return cls.rewrite_path(obj, from_prefix, to_prefix)
-        return obj
-
-class JsonRpcProxy:
-    """JSON-RPC message proxy with path rewriting."""
-    
-    def __init__(self):
-        self.rewriter = PathRewriter()
-        self.child = None
-        self.start_server()
-    
-    def start_server(self):
-        """Start the Pyright language server."""
-        try:
-            self.child = subprocess.Popen(
-                [sys.executable, "-m", "pyright", "--stdio"],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=False,  # Use binary mode for better control
-                bufsize=0
-            )
-            logger.info("Pyright server started successfully")
-            
-            # Start stderr pump thread
-            threading.Thread(target=self.pump_stderr, daemon=True).start()
-        except Exception as e:
-            logger.error(f"Failed to start Pyright: {e}")
-            sys.exit(1)
-    
-    def pump_stderr(self):
-        """Forward stderr from child process."""
-        try:
-            for line in self.child.stderr:
-                sys.stderr.buffer.write(line)
-                sys.stderr.buffer.flush()
-        except Exception as e:
-            logger.error(f"Error pumping stderr: {e}")
-    
-    def read_message(self, stream) -> Optional[Dict]:
-        """Read a JSON-RPC message from stream."""
-        try:
-            headers = {}
-            while True:
-                line = stream.readline()
-                if not line:
-                    return None
-                if line == b"\r\n":
-                    break
-                if b":" in line:
-                    key, value = line.decode('utf-8').split(":", 1)
-                    headers[key.strip().lower()] = value.strip()
-            
-            content_length = int(headers.get("content-length", 0))
-            if content_length == 0:
-                logger.warning("No content-length header found")
-                return None
-            
-            body = stream.read(content_length)
-            return json.loads(body.decode('utf-8'))
-        except Exception as e:
-            logger.error(f"Error reading message: {e}")
-            return None
-    
-    def write_message(self, stream, obj: Dict):
-        """Write a JSON-RPC message to stream."""
-        try:
-            content = json.dumps(obj, separators=(",", ":"))
-            content_bytes = content.encode('utf-8')
-            header = f"Content-Length: {len(content_bytes)}\r\n\r\n"
-            stream.write(header.encode('utf-8'))
-            stream.write(content_bytes)
-            stream.flush()
-        except Exception as e:
-            logger.error(f"Error writing message: {e}")
-    
-    def run(self):
-        """Main proxy loop."""
-        logger.info("Starting proxy loop")
-        
-        while True:
-            try:
-                # Read from client (Neovim)
-                msg = self.read_message(sys.stdin.buffer)
-                if msg is None:
-                    logger.info("Client disconnected")
-                    break
-                
-                # Log request type for debugging
-                method = msg.get("method", "")
-                if method:
-                    logger.debug(f"Request: {method}")
-                
-                # Rewrite paths: host -> container
-                msg = self.rewriter.rewrite_obj(msg, HOST_ROOT, CONTAINER_ROOT)
-                
-                # Send to server
-                self.write_message(self.child.stdin, msg)
-                
-                # Handle response
-                if "id" in msg:
-                    # Request expects response
-                    resp = self.read_message(self.child.stdout)
-                    if resp is None:
-                        logger.warning("No response from server")
-                        break
-                    
-                    # Rewrite paths: container -> host
-                    resp = self.rewriter.rewrite_obj(resp, CONTAINER_ROOT, HOST_ROOT)
-                    self.write_message(sys.stdout.buffer, resp)
-                
-            except KeyboardInterrupt:
-                logger.info("Interrupted by user")
-                break
-            except Exception as e:
-                logger.error(f"Unexpected error: {e}\n{traceback.format_exc()}")
-                break
-        
-        # Cleanup
-        if self.child:
-            self.child.terminate()
-            self.child.wait()
-        logger.info("Proxy terminated")
-
-if __name__ == "__main__":
-    proxy = JsonRpcProxy()
-    proxy.run()
-]]
-
-	vim.fn.writefile(vim.split(shim, "\n"), shim_path)
-	vim.fn.setfperm(shim_path, "rwxr-xr-x")
-	return shim_path
+	return dest_shim
 end
 
 -- Docker utilities ------------------------------------------------------------
@@ -484,7 +307,12 @@ local function build_docker_cmd(opts)
 	local container = opts.path_map and opts.path_map.container_root or opts.workdir
 
 	host = normalize_path(host)
-	local shim_path = write_shim_file(host, container)
+	local shim_path = setup_shim_file(host, container)
+
+	if not shim_path then
+		vim.notify("Failed to setup shim script", vim.log.levels.ERROR)
+		return nil
+	end
 
 	local cmd = vim.deepcopy(opts.compose_cmd or { "docker", "compose" })
 	vim.list_extend(cmd, {
@@ -502,6 +330,12 @@ local function build_docker_cmd(opts)
 	if vim.env.DEBUG_DOCKER_PYTHON then
 		table.insert(cmd, "-e")
 		table.insert(cmd, "DEBUG_SHIM=1")
+	end
+
+	-- Optional: custom log file location
+	if M.state.opts.shim_log_file then
+		table.insert(cmd, "-e")
+		table.insert(cmd, "SHIM_LOG_FILE=" .. M.state.opts.shim_log_file)
 	end
 
 	vim.list_extend(cmd, {
@@ -737,7 +571,12 @@ function M.activate_interpreter(interpreter)
 			opts = interpreter.opts,
 			settings = M.state.opts.pyright_settings,
 		}
-		start_pyright(build_docker_cmd(interpreter.opts), M.state.opts.pyright_settings)
+		local cmd = build_docker_cmd(interpreter.opts)
+		if not cmd then
+			vim.notify("Failed to build Docker command", vim.log.levels.ERROR)
+			return
+		end
+		start_pyright(cmd, M.state.opts.pyright_settings)
 		vim.notify("Switched to Docker: " .. interpreter.opts.service, vim.log.levels.INFO)
 	elseif interpreter.kind == "venv" then
 		if not is_executable(interpreter.python) then
