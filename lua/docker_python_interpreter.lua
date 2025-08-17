@@ -2,7 +2,7 @@ local M = {}
 
 -- Dependencies check
 local deps = {}
-for _, dep in ipairs({ "lspconfig", "plenary.path", "plenary.job" }) do
+for _, dep in ipairs({ "lspconfig", "plenary.path" }) do
 	local name = dep:match("([^.]+)")
 	deps[name] = pcall(require, dep)
 end
@@ -15,7 +15,6 @@ end
 local lspconfig = require("lspconfig")
 local util = require("lspconfig.util")
 local Path = deps.plenary and require("plenary.path") or nil
-local Job = deps.plenary and require("plenary.job") or nil
 
 -- State Management ------------------------------------------------------------
 M.state = {
@@ -26,11 +25,6 @@ M.state = {
 		venvs_timestamp = 0,
 		docker_available = nil,
 		container_pyright = nil,
-	},
-	health = {
-		last_check = 0,
-		status = "unknown",
-		details = {},
 	},
 }
 
@@ -43,7 +37,6 @@ M.defaults = {
 		path_map = { container_root = "/srv/app", host_root = nil },
 		auto_install_pyright = true,
 		pip_install_method = "auto", -- "auto", "system", "user", "break-system-packages"
-		health_check_interval = 300, -- seconds
 	},
 	pyright_settings = {
 		python = {
@@ -409,54 +402,6 @@ local function start_pyright(cmd, settings)
 	end, 100)
 end
 
--- Health check system ---------------------------------------------------------
-function M.health_check()
-	local health = {
-		status = "healthy",
-		details = {},
-		timestamp = os.time(),
-	}
-
-	-- Check current interpreter
-	if not M.state.current then
-		health.status = "unconfigured"
-		health.details.interpreter = "No interpreter selected"
-	elseif M.state.current.kind == "docker" then
-		-- Check Docker health
-		if not check_docker_available() then
-			health.status = "unhealthy"
-			health.details.docker = "Docker not available"
-		elseif not check_container_running(M.state.current.opts.service) then
-			health.status = "unhealthy"
-			health.details.container = "Container not running"
-		elseif not check_pyright_in_container(M.state.current.opts.service) then
-			health.status = "degraded"
-			health.details.pyright = "Pyright not installed in container"
-		end
-	elseif M.state.current.kind == "venv" then
-		-- Check venv health
-		if not is_executable(M.state.current.python) then
-			health.status = "unhealthy"
-			health.details.python = "Python binary not found"
-		end
-	end
-
-	-- Check LSP client
-	local active = false
-	for _, client in ipairs(vim.lsp.get_clients()) do
-		if client.name == "pyright" or client.name == "pyright_docker" then
-			active = true
-			break
-		end
-	end
-	if not active then
-		health.status = health.status == "healthy" and "degraded" or health.status
-		health.details.lsp = "Pyright LSP not running"
-	end
-
-	M.state.health = health
-	return health
-end
 
 -- Public API ------------------------------------------------------------------
 function M.setup(opts)
@@ -479,19 +424,6 @@ function M.setup(opts)
 		M.select_interpreter()
 	end, { desc = "Select Python interpreter for Pyright LSP" })
 
-	vim.api.nvim_create_user_command("PythonInterpreterInfo", function()
-		local info = {
-			current = M.state.current,
-			health = M.health_check(),
-		}
-		vim.notify(vim.inspect(info), vim.log.levels.INFO)
-	end, { desc = "Show current Python interpreter info" })
-
-	vim.api.nvim_create_user_command("PythonInterpreterHealth", function()
-		local health = M.health_check()
-		local level = health.status == "healthy" and vim.log.levels.INFO or vim.log.levels.WARN
-		vim.notify("Health: " .. health.status .. "\n" .. vim.inspect(health.details), level)
-	end, { desc = "Check Python interpreter health" })
 
 	vim.api.nvim_create_user_command("RestartPyright", function()
 		if not M.state.current then
@@ -506,16 +438,6 @@ function M.setup(opts)
 		vim.defer_fn(function()
 			M.auto_select()
 		end, 100)
-	end
-
-	-- Set up health check timer if configured
-	if M.state.opts.docker.health_check_interval > 0 then
-		vim.fn.timer_start(M.state.opts.docker.health_check_interval * 1000, function()
-			local health = M.health_check()
-			if health.status == "unhealthy" then
-				vim.notify("Python interpreter unhealthy: " .. vim.inspect(health.details), vim.log.levels.WARN)
-			end
-		end, { ["repeat"] = -1 })
 	end
 end
 
