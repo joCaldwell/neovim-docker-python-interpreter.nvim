@@ -16,6 +16,23 @@ local lspconfig = require("lspconfig")
 local util = require("lspconfig.util")
 local Path = deps.plenary and require("plenary.path") or nil
 
+-- Logging helpers -------------------------------------------------------------
+local function log_debug(msg)
+	vim.notify("docker_python_interpreter: " .. tostring(msg), vim.log.levels.DEBUG)
+end
+
+local function log_info(msg)
+	vim.notify("docker_python_interpreter: " .. tostring(msg), vim.log.levels.INFO)
+end
+
+local function log_warn(msg)
+	vim.notify("docker_python_interpreter: " .. tostring(msg), vim.log.levels.WARN)
+end
+
+local function log_error(msg)
+	vim.notify("docker_python_interpreter: " .. tostring(msg), vim.log.levels.ERROR)
+end
+
 -- State Management ------------------------------------------------------------
 M.state = {
 	current = nil,
@@ -70,11 +87,27 @@ local function merge_tables(...)
 	return result
 end
 
+local function find_git_root(startpath)
+	local git_entry = vim.fs.find('.git', { path = startpath, upward = true })[1]
+	if git_entry then
+		return vim.fs.dirname(git_entry)
+	end
+	return nil
+end
+
 local function project_root()
 	local bufname = vim.api.nvim_buf_get_name(0)
-	local root =
-		util.root_pattern("pyproject.toml", "setup.cfg", "setup.py", "requirements.txt", "Pipfile", ".git")(bufname)
-	return root or vim.fn.getcwd()
+	local startpath = (bufname ~= '' and vim.fs.dirname(bufname)) or ((vim.uv or vim.loop).cwd())
+	local git_root = find_git_root(startpath)
+	if git_root then
+		return git_root
+	end
+	local root_files = { 'pyproject.toml', 'setup.cfg', 'setup.py', 'requirements.txt', 'Pipfile', '.git' }
+	local found = vim.fs.find(root_files, { path = startpath, upward = true })
+	if #found > 0 then
+		return vim.fs.dirname(found[1])
+	end
+	return vim.fn.getcwd()
 end
 
 local function normalize_path(path)
@@ -141,7 +174,7 @@ local function setup_shim_file(host_root, container_root)
 	vim.fn.writefile(source_content, dest_shim)
 	vim.fn.setfperm(dest_shim, "rwxr-xr-x")
 
-	vim.notify("Shim script copied to: " .. dest_shim, vim.log.levels.DEBUG)
+	log_debug("Shim script copied to: " .. dest_shim)
 
 	return dest_shim
 end
@@ -149,6 +182,7 @@ end
 -- Docker utilities ------------------------------------------------------------
 local function check_docker_available()
 	if M.state.cache.docker_available ~= nil then
+		log_debug("Docker availability (cached): " .. tostring(M.state.cache.docker_available))
 		return M.state.cache.docker_available
 	end
 
@@ -156,6 +190,7 @@ local function check_docker_available()
 	local check_cmd = vim.list_extend(vim.deepcopy(compose_cmd), { "version" })
 	local result = vim.fn.system(check_cmd)
 	M.state.cache.docker_available = vim.v.shell_error == 0
+	log_debug("Docker availability checked: " .. tostring(M.state.cache.docker_available))
 
 	return M.state.cache.docker_available
 end
@@ -163,7 +198,9 @@ end
 local function check_container_running(service)
 	local cmd = vim.list_extend(vim.deepcopy(M.state.opts.docker.compose_cmd), { "ps", "-q", service })
 	local result = vim.fn.system(cmd)
-	return vim.v.shell_error == 0 and result ~= ""
+	local running = vim.v.shell_error == 0 and result ~= ""
+	log_debug("Container '" .. service .. "' running: " .. tostring(running))
+	return running
 end
 
 local function check_pyright_in_container(service)
@@ -182,11 +219,12 @@ local function check_pyright_in_container(service)
 
 	vim.fn.system(cmd)
 	M.state.cache.container_pyright = vim.v.shell_error == 0
+	log_debug("Pyright present in container '" .. service .. "': " .. tostring(M.state.cache.container_pyright))
 	return M.state.cache.container_pyright
 end
 
 local function install_pyright_in_container(service)
-	vim.notify("Installing Pyright in container...", vim.log.levels.INFO)
+	log_info("Installing Pyright in container...")
 
 	local install_methods = {}
 	local pip_method = M.state.opts.docker.pip_install_method or "auto"
@@ -211,13 +249,11 @@ local function install_pyright_in_container(service)
 		vim.list_extend(cmd, { "exec", "-T", service })
 		vim.list_extend(cmd, install_args)
 
+		log_debug("Running install in container: " .. table.concat(cmd, " "))
 		local result = vim.fn.system(cmd)
 		if vim.v.shell_error == 0 then
 			M.state.cache.container_pyright = true
-			vim.notify(
-				"Pyright installed successfully" .. (pip_method == "auto" and " (method " .. i .. ")" or ""),
-				vim.log.levels.INFO
-			)
+			log_info("Pyright installed successfully" .. (pip_method == "auto" and " (method " .. i .. ")" or ""))
 			return true
 		end
 	end
@@ -300,7 +336,7 @@ local function build_docker_cmd(opts)
 	local shim_path = setup_shim_file(host, container)
 
 	if not shim_path then
-		vim.notify("Failed to setup shim script", vim.log.levels.ERROR)
+		log_error("Failed to setup shim script")
 		return nil
 	end
 
@@ -339,7 +375,8 @@ local function build_docker_cmd(opts)
 		shim_path:gsub(vim.pesc(host), container),
 	})
 
-	vim.notify("docker pyright cmd: " .. table.concat(cmd, " "), vim.log.levels.DEBUG)
+	log_debug("docker pyright cmd: " .. table.concat(cmd, " "))
+	log_debug("Host root: " .. host .. ", Container root: " .. container .. ", Shim: " .. shim_path)
 
 	return cmd
 end
@@ -351,6 +388,7 @@ end
 local function stop_pyright()
 	for _, client in ipairs(vim.lsp.get_clients()) do
 		if client.name == "pyright" or client.name == "pyright_docker" then
+			log_debug("Stopping LSP client: " .. client.name .. " (id=" .. tostring(client.id) .. ")")
 			client.stop(true)
 		end
 	end
@@ -362,15 +400,17 @@ local function start_pyright(cmd, settings)
 	-- Use a dedicated server name to avoid conflicts with user-configured pyright
 	local server_name = "pyright_docker"
 	local configs = require("lspconfig.configs")
+	log_debug("Preparing to start LSP '" .. server_name .. "' with cmd: " .. table.concat(cmd or {}, " "))
 	local new_config = {
 		cmd = cmd,
 		filetypes = { "python" },
 		root_dir = function(fname)
-			return util.find_git_ancestor(fname) or project_root()
+			local startpath = (fname ~= '' and vim.fs.dirname(fname)) or ((vim.uv or vim.loop).cwd())
+			return find_git_root(startpath) or project_root()
 		end,
 		settings = settings or {},
 		on_init = function(client)
-			vim.notify("Pyright Docker LSP initialized", vim.log.levels.DEBUG)
+			log_debug("Pyright Docker LSP initialized (id=" .. tostring(client.id) .. ")")
 		end,
 		on_attach = function(client, bufnr)
 			if M.state.opts.on_attach then
@@ -387,7 +427,7 @@ local function start_pyright(cmd, settings)
 
 	lspconfig[server_name].setup(new_config)
 
-	vim.notify("Starting Pyright (docker) with command: " .. table.concat(cmd, " "), vim.log.levels.DEBUG)
+	log_debug("Starting Pyright (docker) with command: " .. table.concat(cmd, " "))
 
 	-- Restart for current Python buffers
 	vim.defer_fn(function()
@@ -399,31 +439,38 @@ local function start_pyright(cmd, settings)
 				end)
 			end
 		end
+		local names = {}
+		for _, c in ipairs(vim.lsp.get_clients()) do
+			table.insert(names, c.name .. "(id=" .. tostring(c.id) .. ")")
+		end
+		log_debug("Active LSP clients after start: " .. table.concat(names, ", "))
 	end, 100)
 end
 
-
 -- Public API ------------------------------------------------------------------
 function M.setup(opts)
+	log_info("setup() called")
 	M.state.opts = merge_tables(M.defaults, opts or {})
+	log_debug("Effective options: " .. vim.inspect(M.state.opts))
 
 	-- Ensure core LSP sees a config (prevents :LspInfo warning); do not autostart
-	-- Always call setup to register config with core, regardless of current state
+	log_debug("Registering lspconfig for 'pyright_docker' (autostart=false)")
 	lspconfig["pyright_docker"].setup({
 		autostart = false,
 		cmd = { "pyright-langserver", "--stdio" },
 		filetypes = { "python" },
 		root_dir = function(fname)
-			return util.find_git_ancestor(fname) or project_root()
+			local startpath = (fname ~= '' and vim.fs.dirname(fname)) or ((vim.uv or vim.loop).cwd())
+			return find_git_root(startpath) or project_root()
 		end,
 		settings = M.state.opts.pyright_settings or {},
 	})
+	log_debug("lspconfig 'pyright_docker' registered")
 
 	-- Create user commands
 	vim.api.nvim_create_user_command("SelectPythonInterpreter", function()
 		M.select_interpreter()
 	end, { desc = "Select Python interpreter for Pyright LSP" })
-
 
 	vim.api.nvim_create_user_command("RestartPyright", function()
 		if not M.state.current then
@@ -442,6 +489,7 @@ function M.setup(opts)
 end
 
 function M.select_interpreter()
+	log_info("SelectPythonInterpreter invoked")
 	local choices = {}
 	local items = {}
 
@@ -459,6 +507,7 @@ function M.select_interpreter()
 
 	-- Local venvs
 	local venvs = discover_local_venvs()
+	log_debug("Discovered venvs: " .. vim.inspect(venvs))
 	for _, path in ipairs(venvs) do
 		local display = path:gsub("^" .. vim.pesc(project_root()) .. "/", "")
 		table.insert(choices, "Local: " .. display)
@@ -482,10 +531,12 @@ function M.select_interpreter()
 		end,
 	}, function(choice, idx)
 		if not choice or not idx then
+			log_warn("Interpreter selection cancelled")
 			return
 		end
 
 		local selected = items[idx]
+		log_debug("Interpreter selected: " .. vim.inspect(selected))
 
 		if selected.kind == "docker_unavailable" then
 			vim.notify("Container is not running. Please start it first.", vim.log.levels.ERROR)
@@ -509,6 +560,7 @@ function M.select_interpreter()
 end
 
 function M.activate_interpreter(interpreter)
+	log_info("activate_interpreter called with kind='" .. tostring(interpreter.kind) .. "'")
 	if interpreter.kind == "docker" then
 		-- Ensure container has Pyright
 		if not check_pyright_in_container(interpreter.opts.service) then
@@ -517,10 +569,7 @@ function M.activate_interpreter(interpreter)
 					return
 				end
 			else
-				vim.notify(
-					"Pyright not found in container. Install it or enable auto_install_pyright",
-					vim.log.levels.ERROR
-				)
+				log_error("Pyright not found in container. Install it or enable auto_install_pyright")
 				return
 			end
 		end
@@ -532,14 +581,14 @@ function M.activate_interpreter(interpreter)
 		}
 		local cmd = build_docker_cmd(interpreter.opts)
 		if not cmd then
-			vim.notify("Failed to build Docker command", vim.log.levels.ERROR)
+			log_error("Failed to build Docker command")
 			return
 		end
 		start_pyright(cmd, M.state.opts.pyright_settings)
-		vim.notify("Switched to Docker: " .. interpreter.opts.service, vim.log.levels.INFO)
+		log_info("Switched to Docker: " .. interpreter.opts.service)
 	elseif interpreter.kind == "venv" then
 		if not is_executable(interpreter.python) then
-			vim.notify("Python binary not found: " .. interpreter.python, vim.log.levels.ERROR)
+			log_error("Python binary not found: " .. interpreter.python)
 			return
 		end
 
@@ -549,29 +598,33 @@ function M.activate_interpreter(interpreter)
 			settings = M.state.opts.pyright_settings,
 		}
 		start_pyright(build_local_cmd(interpreter.python), M.state.opts.pyright_settings)
-		vim.notify("Switched to: " .. interpreter.python, vim.log.levels.INFO)
+		log_info("Switched to: " .. interpreter.python)
 	end
 end
 
 function M.restart_with_current()
 	if not M.state.current then
-		vim.notify("No interpreter selected", vim.log.levels.WARN)
+		log_warn("No interpreter selected")
 		return
 	end
 
 	M.activate_interpreter(M.state.current)
-	vim.notify("Pyright restarted", vim.log.levels.INFO)
+	log_info("Pyright restarted")
 end
 
 function M.auto_select()
+	log_debug("auto_select() evaluating options")
 	local docker_available = check_docker_available() and check_container_running(M.state.opts.docker.service)
 	local venvs = discover_local_venvs()
 
 	if M.state.opts.prefer_docker and docker_available then
+		log_debug("Auto-selecting Docker (prefer_docker=true)")
 		M.activate_interpreter({ kind = "docker", opts = M.state.opts.docker })
 	elseif #venvs == 1 and not docker_available then
+		log_debug("Auto-selecting sole venv: " .. venvs[1])
 		M.activate_interpreter({ kind = "venv", python = venvs[1] })
 	elseif #venvs == 0 and docker_available then
+		log_debug("Auto-selecting Docker (no venvs found)")
 		M.activate_interpreter({ kind = "docker", opts = M.state.opts.docker })
 	end
 end
