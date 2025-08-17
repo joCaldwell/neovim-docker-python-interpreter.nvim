@@ -17,6 +17,23 @@ local util = require("lspconfig.util")
 local Path = deps.plenary and require("plenary.path") or nil
 local Job = deps.plenary and require("plenary.job") or nil
 
+-- Pre-register a dedicated docker-backed Pyright server so it is visible to :LspInfo
+do
+	local configs = require("lspconfig.configs")
+	if not configs.pyright_docker then
+		configs.pyright_docker = {
+			default_config = {
+				cmd = { "pyright-langserver", "--stdio" },
+				filetypes = { "python" },
+				root_dir = function(fname)
+					return util.find_git_ancestor(fname) or vim.loop.cwd()
+				end,
+				settings = {},
+			},
+		}
+	end
+end
+
 -- State Management ------------------------------------------------------------
 M.state = {
 	current = nil,
