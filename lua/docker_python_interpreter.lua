@@ -17,23 +17,6 @@ local util = require("lspconfig.util")
 local Path = deps.plenary and require("plenary.path") or nil
 local Job = deps.plenary and require("plenary.job") or nil
 
--- Pre-register a dedicated docker-backed Pyright server so it is visible to :LspInfo
-do
-	local configs = require("lspconfig.configs")
-	if not configs.pyright_docker then
-		configs.pyright_docker = {
-			default_config = {
-				cmd = { "pyright-langserver", "--stdio" },
-				filetypes = { "python" },
-				root_dir = function(fname)
-					return util.find_git_ancestor(fname) or vim.loop.cwd()
-				end,
-				settings = {},
-			},
-		}
-	end
-end
-
 -- State Management ------------------------------------------------------------
 M.state = {
 	current = nil,
@@ -478,21 +461,6 @@ end
 -- Public API ------------------------------------------------------------------
 function M.setup(opts)
 	M.state.opts = merge_tables(M.defaults, opts or {})
-
-	-- Pre-register docker-backed Pyright server so it shows in :LspInfo
-	local configs = require("lspconfig.configs")
-	if not configs.pyright_docker then
-		configs.pyright_docker = {
-			default_config = {
-				cmd = { "pyright-langserver", "--stdio" },
-				filetypes = { "python" },
-				root_dir = function(fname)
-					return util.find_git_ancestor(fname) or project_root()
-				end,
-				settings = M.state.opts.pyright_settings or {},
-			},
-		}
-	end
 
 	-- Ensure core LSP sees a config (prevents :LspInfo warning); do not autostart
 	-- Always call setup to register config with core, regardless of current state
