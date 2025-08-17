@@ -88,7 +88,7 @@ local function normalize_path(path)
 	if Path then
 		return Path:new(vim.fn.expand(path)):absolute()
 	end
-	return vim.fn.fnamemodify(path, ":p")
+	return vim.fn.fnamemodify(vim.fn.expand(path), ":p")
 end
 
 local function ensure_dir(p)
@@ -331,8 +331,13 @@ local function build_docker_cmd(opts)
 
 	-- Optional: custom log file location
 	if M.state.opts.shim_log_file then
+		local log_path = normalize_path(M.state.opts.shim_log_file)
+		-- If the log path is within the host project root, map it to container path
+		if vim.startswith(log_path, host) then
+			log_path = log_path:gsub(vim.pesc(host), container)
+		end
 		table.insert(cmd, "-e")
-		table.insert(cmd, "SHIM_LOG_FILE=" .. M.state.opts.shim_log_file)
+		table.insert(cmd, "SHIM_LOG_FILE=" .. log_path)
 	end
 
 	vim.list_extend(cmd, {
@@ -340,6 +345,8 @@ local function build_docker_cmd(opts)
 		"python",
 		shim_path:gsub(vim.pesc(host), container),
 	})
+
+	vim.notify("docker pyright cmd: " .. table.concat(cmd, " "), vim.log.levels.DEBUG)
 
 	return cmd
 end
@@ -349,38 +356,53 @@ local function build_local_cmd(python_bin)
 end
 
 local function stop_pyright()
-	for _, client in ipairs(vim.lsp.get_active_clients({ name = "pyright" })) do
-		client.stop(true)
+	for _, client in ipairs(vim.lsp.get_active_clients()) do
+		if client.name == "pyright" or client.name == "pyright_docker" then
+			client.stop(true)
+		end
 	end
 end
 
 local function start_pyright(cmd, settings)
 	stop_pyright()
 
-	lspconfig.pyright.setup({
+	-- Use a dedicated server name to avoid conflicts with user-configured pyright
+	local server_name = "pyright_docker"
+	local configs = require("lspconfig.configs")
+	local new_config = {
 		cmd = cmd,
+		filetypes = { "python" },
 		root_dir = function(fname)
 			return util.find_git_ancestor(fname) or project_root()
 		end,
 		settings = settings or {},
 		on_init = function(client)
-			-- Additional initialization if needed
-			vim.notify("Pyright LSP initialized", vim.log.levels.DEBUG)
+			vim.notify("Pyright Docker LSP initialized", vim.log.levels.DEBUG)
 		end,
 		on_attach = function(client, bufnr)
-			-- Custom on_attach logic
 			if M.state.opts.on_attach then
 				M.state.opts.on_attach(client, bufnr)
 			end
 		end,
-	})
+	}
+
+	if not configs[server_name] then
+		configs[server_name] = { default_config = new_config }
+	else
+		configs[server_name].default_config = new_config
+	end
+
+	lspconfig[server_name].setup(new_config)
+
+	vim.notify("Starting Pyright (docker) with command: " .. table.concat(cmd, " "), vim.log.levels.DEBUG)
 
 	-- Restart for current Python buffers
 	vim.defer_fn(function()
 		for _, buf in ipairs(vim.api.nvim_list_bufs()) do
 			if vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].filetype == "python" then
 				vim.api.nvim_buf_call(buf, function()
-					vim.cmd("LspStart pyright")
+					vim.cmd("LspStop pyright")
+					vim.cmd("LspStart " .. server_name)
 				end)
 			end
 		end
@@ -420,8 +442,14 @@ function M.health_check()
 	end
 
 	-- Check LSP client
-	local clients = vim.lsp.get_active_clients({ name = "pyright" })
-	if #clients == 0 then
+	local active = false
+	for _, client in ipairs(vim.lsp.get_active_clients()) do
+		if client.name == "pyright" or client.name == "pyright_docker" then
+			active = true
+			break
+		end
+	end
+	if not active then
 		health.status = health.status == "healthy" and "degraded" or health.status
 		health.details.lsp = "Pyright LSP not running"
 	end
