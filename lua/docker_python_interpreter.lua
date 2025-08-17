@@ -455,14 +455,22 @@ function M.setup(opts)
 
 	-- Ensure core LSP sees a config (prevents :LspInfo warning); do not autostart
 	log_debug("Registering lspconfig for 'pyright_docker' (autostart=false)")
+	local configs = require("lspconfig.configs")
+	if not configs.pyright_docker then
+		configs.pyright_docker = {
+			default_config = {
+				cmd = { "pyright-langserver", "--stdio" },
+				filetypes = { "python" },
+				root_dir = function(fname)
+					local startpath = (fname ~= '' and vim.fs.dirname(fname)) or ((vim.uv or vim.loop).cwd())
+					return find_git_root(startpath) or project_root()
+				end,
+				settings = M.state.opts.pyright_settings or {},
+			},
+		}
+	end
 	lspconfig["pyright_docker"].setup({
 		autostart = false,
-		cmd = { "pyright-langserver", "--stdio" },
-		filetypes = { "python" },
-		root_dir = function(fname)
-			local startpath = (fname ~= '' and vim.fs.dirname(fname)) or ((vim.uv or vim.loop).cwd())
-			return find_git_root(startpath) or project_root()
-		end,
 		settings = M.state.opts.pyright_settings or {},
 	})
 	log_debug("lspconfig 'pyright_docker' registered")
