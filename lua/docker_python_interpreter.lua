@@ -409,6 +409,7 @@ local function start_pyright(cmd, settings)
 			return find_git_root(startpath) or project_root()
 		end,
 		settings = settings or {},
+		autostart = true,
 		on_init = function(client)
 			log_debug("Pyright Docker LSP initialized (id=" .. tostring(client.id) .. ")")
 		end,
@@ -429,16 +430,47 @@ local function start_pyright(cmd, settings)
 
 	log_debug("Starting Pyright (docker) with command: " .. table.concat(cmd, " "))
 
-	-- Restart for current Python buffers
+	-- Attach to existing Python buffers using the manager
 	vim.defer_fn(function()
+		local manager = lspconfig[server_name] and lspconfig[server_name].manager or nil
+		if not manager then
+			log_warn("LSP manager for '" .. server_name .. "' not available after setup")
+			return
+		end
+		local attached = {}
 		for _, buf in ipairs(vim.api.nvim_list_bufs()) do
 			if vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].filetype == "python" then
-				vim.api.nvim_buf_call(buf, function()
-					vim.cmd("LspStop pyright")
-					vim.cmd("LspStart " .. server_name)
+				local ok, err = pcall(function()
+					manager.try_add_wrapper(buf)
 				end)
+				if ok then
+					table.insert(attached, tostring(buf))
+				else
+					log_warn("Failed to attach '" .. server_name .. "' to buf " .. tostring(buf) .. ": " .. tostring(err))
+				end
 			end
 		end
+		if #attached > 0 then
+			log_debug("Attached '" .. server_name .. "' to python buffers: " .. table.concat(attached, ", "))
+		else
+			log_debug("No python buffers to attach; will attach on future FileType events")
+		end
+		-- Ensure future python buffers attach automatically
+		vim.api.nvim_create_autocmd("FileType", {
+			pattern = "python",
+			callback = function(args)
+				local buf = args.buf
+				local ok, err = pcall(function()
+					manager.try_add_wrapper(buf)
+				end)
+				if ok then
+					log_debug("Auto-attached '" .. server_name .. "' to buf " .. tostring(buf))
+				else
+					log_warn("Auto-attach failed for buf " .. tostring(buf) .. ": " .. tostring(err))
+				end
+			end,
+		})
+
 		local names = {}
 		for _, c in ipairs(vim.lsp.get_clients()) do
 			table.insert(names, c.name .. "(id=" .. tostring(c.id) .. ")")
@@ -454,7 +486,7 @@ function M.setup(opts)
 	log_debug("Effective options: " .. vim.inspect(M.state.opts))
 
 	-- Ensure core LSP sees a config (prevents :LspInfo warning); do not autostart
-	log_debug("Registering lspconfig for 'pyright_docker' (autostart=false)")
+	log_debug("Registering lspconfig for 'pyright_docker' (autostart=true)")
 	local configs = require("lspconfig.configs")
 	if not configs.pyright_docker then
 		configs.pyright_docker = {
@@ -470,7 +502,7 @@ function M.setup(opts)
 		}
 	end
 	lspconfig["pyright_docker"].setup({
-		autostart = false,
+		autostart = true,
 		settings = M.state.opts.pyright_settings or {},
 	})
 	log_debug("lspconfig 'pyright_docker' registered")
