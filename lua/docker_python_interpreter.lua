@@ -460,7 +460,7 @@ function M.health_check()
 
 	-- Check LSP client
 	local active = false
-	for _, client in ipairs(vim.lsp.get_active_clients()) do
+	for _, client in ipairs(vim.lsp.get_clients()) do
 		if client.name == "pyright" or client.name == "pyright_docker" then
 			active = true
 			break
@@ -492,6 +492,19 @@ function M.setup(opts)
 				settings = M.state.opts.pyright_settings or {},
 			},
 		}
+	end
+
+	-- Ensure core LSP sees a config (prevents :LspInfo warning); do not autostart
+	if lspconfig.pyright_docker then
+		lspconfig.pyright_docker.setup({
+			autostart = false,
+			cmd = { "pyright-langserver", "--stdio" },
+			filetypes = { "python" },
+			root_dir = function(fname)
+				return util.find_git_ancestor(fname) or project_root()
+			end,
+			settings = M.state.opts.pyright_settings or {},
+		})
 	end
 
 	-- Create user commands
