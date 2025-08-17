@@ -86,7 +86,7 @@ end
 
 local function normalize_path(path)
 	if Path then
-		return Path:new(path):make_absolute()
+		return Path:new(vim.fn.expand(path)):absolute()
 	end
 	return vim.fn.fnamemodify(path, ":p")
 end
@@ -178,17 +178,14 @@ local function check_pyright_in_container(service)
 		return M.state.cache.container_pyright
 	end
 
-	local cmd = vim.list_extend(
-		vim.deepcopy(M.state.opts.docker.compose_cmd),
-		{
-			"exec",
-			"-T",
-			service,
-			"python",
-			"-c",
-			"import sys; import importlib.util; sys.exit(0 if importlib.util.find_spec('pyright') else 1)",
-		}
-	)
+	local cmd = vim.list_extend(vim.deepcopy(M.state.opts.docker.compose_cmd), {
+		"exec",
+		"-T",
+		service,
+		"python",
+		"-c",
+		"import sys; import importlib.util; sys.exit(0 if importlib.util.find_spec('pyright') else 1)",
+	})
 
 	vim.fn.system(cmd)
 	M.state.cache.container_pyright = vim.v.shell_error == 0
