@@ -495,17 +495,16 @@ function M.setup(opts)
 	end
 
 	-- Ensure core LSP sees a config (prevents :LspInfo warning); do not autostart
-	if lspconfig.pyright_docker then
-		lspconfig.pyright_docker.setup({
-			autostart = false,
-			cmd = { "pyright-langserver", "--stdio" },
-			filetypes = { "python" },
-			root_dir = function(fname)
-				return util.find_git_ancestor(fname) or project_root()
-			end,
-			settings = M.state.opts.pyright_settings or {},
-		})
-	end
+	-- Always call setup to register config with core, regardless of current state
+	lspconfig["pyright_docker"].setup({
+		autostart = false,
+		cmd = { "pyright-langserver", "--stdio" },
+		filetypes = { "python" },
+		root_dir = function(fname)
+			return util.find_git_ancestor(fname) or project_root()
+		end,
+		settings = M.state.opts.pyright_settings or {},
+	})
 
 	-- Create user commands
 	vim.api.nvim_create_user_command("SelectPythonInterpreter", function()
