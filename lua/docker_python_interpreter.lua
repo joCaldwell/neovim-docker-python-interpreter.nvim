@@ -373,7 +373,7 @@ local function build_local_cmd(python_bin)
 end
 
 local function stop_pyright()
-	for _, client in ipairs(vim.lsp.get_active_clients()) do
+	for _, client in ipairs(vim.lsp.get_clients()) do
 		if client.name == "pyright" or client.name == "pyright_docker" then
 			client.stop(true)
 		end
