@@ -462,6 +462,21 @@ end
 function M.setup(opts)
 	M.state.opts = merge_tables(M.defaults, opts or {})
 
+	-- Pre-register docker-backed Pyright server so it shows in :LspInfo
+	local configs = require("lspconfig.configs")
+	if not configs.pyright_docker then
+		configs.pyright_docker = {
+			default_config = {
+				cmd = { "pyright-langserver", "--stdio" },
+				filetypes = { "python" },
+				root_dir = function(fname)
+					return util.find_git_ancestor(fname) or project_root()
+				end,
+				settings = M.state.opts.pyright_settings or {},
+			},
+		}
+	end
+
 	-- Create user commands
 	vim.api.nvim_create_user_command("SelectPythonInterpreter", function()
 		M.select_interpreter()
